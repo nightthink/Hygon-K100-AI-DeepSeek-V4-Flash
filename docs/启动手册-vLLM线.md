@@ -123,4 +123,4 @@ cd /home/user/image_bake/vllm && docker build -t lzd/dsv4-flash-k100ai-vllm:0706
 
 ---
 
-Copyright © 2026 DaoTech Team. All rights reserved.
+Copyright © 2026 DaoTech Team. Licensed under the MIT License.
