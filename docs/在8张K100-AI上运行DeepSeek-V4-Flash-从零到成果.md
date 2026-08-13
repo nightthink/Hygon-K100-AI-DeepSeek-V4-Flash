@@ -705,3 +705,7 @@ vLLM 0.21.0；vllm_hcu 平台插件；DAS torch 2.10 / triton / tilelang（PDL �
 ---
 
 *文档生成：2026-08-12。全部数据来自 nodeA 实测；调优过程逐轮记录见 `/data1/TUNING_RECORD_20260811.md`。*
+
+---
+
+Copyright © 2026 DaoTech Team. All rights reserved.
