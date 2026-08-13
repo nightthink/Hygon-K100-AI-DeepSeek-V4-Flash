@@ -48,3 +48,7 @@ scripts/
 - 基础镜像来自海光 sourcefind 仓库（`harbor.sourcefind.cn:5443`），补丁以 Dockerfile 固化为新镜像，不含默认入口，参数全部经环境变量传入。
 
 *文档基线日期：2026-08-13。*
+
+---
+
+Copyright © 2026 DaoTech Team. All rights reserved.
