@@ -156,3 +156,7 @@ cd /home/user/image_bake/sglang && docker build -t lzd/dsv4-flash-k100ai-sglang:
 4. lpm 显著占优 → 写入生产配置（`-e SCHED_POLICY=lpm` 加进启动脚本）；否则维持 fcfs。
 
 **判停条件**：无论哪种方法，若 lpm 下出现个别请求长时间饥饿（P99 排队时间显著上升），即使平均值占优也建议维持 fcfs——编程助手场景下"个别用户等很久"比"平均快一点"伤害更大。
+
+---
+
+Copyright © 2026 DaoTech Team. All rights reserved.
