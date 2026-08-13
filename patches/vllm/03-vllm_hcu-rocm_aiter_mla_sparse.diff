@@ -1,0 +1,66 @@
+--- /tmp/orig/hcu_rocm_aiter_mla_sparse.py	2026-08-10 01:28:30.673949901 +0800
++++ /data1/mla_sparse_patched.py	2026-08-10 00:47:18.825587540 +0800
+@@ -1003,7 +1003,7 @@
+ ) -> torch.Tensor:
+     # careful! this will be None in dummy run
+     attn_metadata = get_forward_context().attn_metadata
+-    fp8_dtype = current_platform.fp8_dtype() if not current_platform.is_rocm() or on_gfx938() else k.dtype
++    fp8_dtype = current_platform.fp8_dtype()  # patched: fp8 end-to-end on gfx928 (fused insert kernel writes fp8 layout)
+     from vllm import _custom_ops as ops
+     from vllm.utils.torch_utils import _resolve_layer_name
+ 
+@@ -1053,10 +1053,12 @@
+                 scale_fmt,
+             )
+         else:
+-            indexer_k_bf16_cache_triton(
++            indexer_k_quant_and_cache_triton(  # patched: fp8 path
+                 k,
+                 kv_cache,
+                 slot_mapping,
++                quant_block_size,
++                scale_fmt,
+             )
+             # indexer_k_quant_and_cache_triton(
+             #     k,
+@@ -1090,11 +1092,13 @@
+                     chunk.cu_seq_lens,
+                 )
+             else:
+-                cp_gather_indexer_k_bf16_cache_triton(
++                cp_gather_indexer_k_quant_cache_triton(  # patched: fp8 path
+                     kv_cache,
+                     k_fp8,
++                    k_scale,
+                     chunk.block_table,
+                     chunk.cu_seq_lens,
++                    token_to_seq=chunk.token_to_seq,
+                 )
+                 # cp_gather_indexer_k_quant_cache_triton(
+                 #     kv_cache,
+@@ -1305,9 +1309,22 @@
+         )
+         wo_a_weight = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
+     else:
+-        wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
+-            torch.bfloat16
+-        )
++        _w = wo_a.weight
++        if _w.shape[0] == n_local_groups * o_lora_rank:
++            # upstream vllm layout: [out=groups*o_lora, in=hidden]
++            wo_a_weight = _w.view(n_local_groups, o_lora_rank, hidden_dim).to(
++                torch.bfloat16
++            )
++        else:
++            # patched(gfx928): hygon pluggable linear stores weight transposed
++            # ([in=hidden, out=groups*o_lora]); a raw .view() on it silently
++            # scrambles memory. Rebuild the [groups, o_lora, hidden] tensor
++            # from the transposed layout instead.
++            wo_a_weight = (
++                _w.view(hidden_dim, n_local_groups, o_lora_rank)
++                .permute(1, 2, 0)
++                .to(torch.bfloat16)
++            )
+ 
+     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+ 

@@ -1,0 +1,47 @@
+--- /tmp/orig/mhc.py	2026-08-10 01:28:30.665949922 +0800
++++ /data1/mhc_patched.py	2026-08-09 16:52:42.081566123 +0800
+@@ -79,7 +79,7 @@
+     layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]  # type: ignore[no-redef, valid-type]
+ 
+     with T.Kernel(num_tokens, threads=96) as i:
+-        T.pdl_sync()
++        pass  # T.pdl_sync()  # patched: no PDL on gfx928
+         ##################################################################
+         # _pre_norm_fn_fwd_norm
+         rms = T.alloc_fragment(1, T.float32)
+@@ -504,7 +504,7 @@
+         T.clear(sqr)
+         h_split_start = i_ks * h_per_split
+ 
+-        T.pdl_sync()
++        pass  # T.pdl_sync()  # patched: no PDL on gfx928
+ 
+         T.copy(post_mix[i_n, 0], s_post)
+         T.copy(comb_mix[i_n, 0, 0], s_comb)
+@@ -563,7 +563,7 @@
+                     v2 += s_warp[w, tile_n]
+                 rp_out[i_ks, i_n] = v2
+ 
+-        T.pdl_trigger()
++        pass  # T.pdl_trigger()  # patched: no PDL on gfx928
+ 
+ 
+ def mhc_post(
+@@ -874,7 +874,7 @@
+     out: T.Tensor[[num_tokens, hidden_size], T.bfloat16]  # type: ignore[no-redef,valid-type]
+ 
+     with T.Kernel(num_tokens, threads=n_thr) as i:
+-        T.pdl_sync()
++        pass  # T.pdl_sync()  # patched: no PDL on gfx928
+ 
+         # ------------------------------------------------------------------
+         # Pass 1 – for each residual channel m_c and h_block:
+@@ -932,7 +932,7 @@
+ 
+             T.copy(ol, out[i, i0_h * h_block], disable_tma=True)
+ 
+-        T.pdl_trigger()
++        pass  # T.pdl_trigger()  # patched: no PDL on gfx928
+ 
+ 
+ def _hc_head_fused_reference(

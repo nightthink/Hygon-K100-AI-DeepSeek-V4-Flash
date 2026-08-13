@@ -1,0 +1,176 @@
+--- /tmp/orig/deepseek_v4_attention.py	2026-08-10 01:28:30.669949911 +0800
++++ /data1/dsv4_attn_patched.py	2026-08-10 00:55:06.948352508 +0800
+@@ -312,6 +312,15 @@
+ 
+         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
+         if current_platform.is_rocm():
++            import os as _os
++            if _os.environ.get("DSV4_DEBUG") == "1" and _DSV4A_SEEN.get("oproj_info", 0) < 1:
++                _DSV4A_SEEN["oproj_info"] = 1
++                print(f"[dsv4adbg] oproj: n_local_heads={self.n_local_heads} "
++                      f"n_local_groups={self.n_local_groups} o_lora_rank={self.o_lora_rank} "
++                      f"rope_head_dim={self.rope_head_dim} nope={self.nope_head_dim} "
++                      f"o.shape={tuple(o.shape)} wo_a.w={tuple(self.wo_a.weight.shape)} "
++                      f"wo_b.w={tuple(self.wo_b.weight.shape)} "
++                      f"has_scale={hasattr(self.wo_a, 'weight_scale_inv')}", flush=True)
+             z = rocm_inv_rope_einsum(
+                 self.rotary_emb,
+                 o,
+@@ -321,7 +330,20 @@
+                 self.o_lora_rank,
+                 self.wo_a,
+             )
+-            return self.wo_b(z.flatten(1))
++            import os as _os2
++            _dd = _os2.environ.get("DSV4_DUMP", "")
++            if _dd and o.shape[0] < 100 and _DSV4A_SEEN.get("oproj2", 0) < 1:
++                _DSV4A_SEEN["oproj2"] = 1
++                _pid = _os2.getpid()
++                torch.save(o.detach().cpu(), f"{_dd}/oproj2.o.pid{_pid}.pt")
++                torch.save(z.detach().cpu(), f"{_dd}/oproj2.z.pid{_pid}.pt")
++                torch.save(self.wo_a.weight.detach().cpu(), f"{_dd}/oproj2.woa.pid{_pid}.pt")
++                torch.save(self.wo_b.weight.detach().cpu(), f"{_dd}/oproj2.wob.pid{_pid}.pt")
++            _res = self.wo_b(z.flatten(1))
++            if _dd and o.shape[0] < 100 and _DSV4A_SEEN.get("oproj2f", 0) < 1:
++                _DSV4A_SEEN["oproj2f"] = 1
++                torch.save(_res.detach().cpu(), f"{_dd}/oproj2.final.pid{_os2.getpid()}.pt")
++            return _res
+ 
+         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
+         o_fp8, o_scale = fused_inv_rope_fp8_quant(
+@@ -374,7 +396,7 @@
+             def compressor_kv_score() -> torch.Tensor:
+                 return torch.mm(
+                     hidden_states,
+-                    compressor.fused_wkv_wgate.weight.T,
++                    (compressor.fused_wkv_wgate.weight.T if compressor.fused_wkv_wgate.weight.shape[1] == hidden_states.shape[-1] else compressor.fused_wkv_wgate.weight),  # patched: layout-adaptive
+                     out_dtype=torch.float32,
+                 )
+ 
+@@ -391,7 +413,7 @@
+             def indexer_compressor_kv_score() -> torch.Tensor:
+                 return torch.mm(
+                     hidden_states,
+-                    indexer.compressor.fused_wkv_wgate.weight.T,
++                    (indexer.compressor.fused_wkv_wgate.weight.T if indexer.compressor.fused_wkv_wgate.weight.shape[1] == hidden_states.shape[-1] else indexer.compressor.fused_wkv_wgate.weight),  # patched: layout-adaptive
+                     out_dtype=torch.float32,
+                 )
+ 
+@@ -436,6 +458,9 @@
+             self.kv_norm.weight.data,
+             self.eps,
+         )
++        if isinstance(attn_metadata, dict):
++            _dsv4a_dbg("attn.qr", qr)
++            _dsv4a_dbg("attn.kv", kv)
+ 
+         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
+         # on the default stream so q stays on its consumer stream (mla_attn
+@@ -520,7 +545,9 @@
+ 
+         # MLA attention writes into the pre-allocated `out` buffer
+         # ([num_tokens, padded_heads, head_dim]).
++        _dsv4a_dbg("attn.q_premla", q)
+         self.mla_attn(q, kv, positions, output=out)
++        _dsv4a_dbg("attn.out_postmla", out)
+ 
+     def _fused_qnorm_rope_kv_insert(
+         self,
+@@ -547,18 +574,66 @@
+         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
+         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
+         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
+-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+-            q,
+-            kv,
++        # patched(gfx928): torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
++        # is broken on this platform (KV bytes decode to NaN; q side untrusted).
++        # Reimplement both sides: q per-head RMSNorm + GPT-J RoPE in python,
++        # KV GPT-J RoPE in python + upstream triton quant-insert kernel
++        # (same family/layout as the dequant reader).
++        _pos0 = positions.to(torch.int64)
++        _cs0 = self.rotary_emb.cos_sin_cache.index_select(0, _pos0).float()  # [T, rope]
++        _rd = _cs0.shape[-1] // 2
++        _nope = q.shape[-1] - 2 * _rd  # 448 for rope 64
++        # ---- q side: per-head rmsnorm (no weight) then GPT-J rope on last dims
++        _qf = q.float()
++        _qn = _qf * torch.rsqrt(_qf.pow(2).mean(-1, keepdim=True) + self.eps)
++        _qcos = _cs0[:, :_rd].unsqueeze(1)  # [T,1,rd]
++        _qsin = _cs0[:, _rd:].unsqueeze(1)
++        _q1 = _qn[..., _nope + 0 :: 2].clone()
++        _q2 = _qn[..., _nope + 1 :: 2].clone()
++        _qn[..., _nope + 0 :: 2] = _q1 * _qcos - _q2 * _qsin
++        _qn[..., _nope + 1 :: 2] = _q2 * _qcos + _q1 * _qsin
++        q.copy_(_qn.to(q.dtype))
++        from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
++            quantize_and_insert_k_cache as _tl_insert_k,
++        )
++        _kv_fix = kv.clone()
++        _d = _rd
++        _cos, _sin = _cs0[:, :_d], _cs0[:, _d:]
++        _x1 = _kv_fix[:, 448 + 0 :: 2].float()
++        _x2 = _kv_fix[:, 448 + 1 :: 2].float()
++        _kv_fix[:, 448 + 0 :: 2] = (_x1 * _cos - _x2 * _sin).to(_kv_fix.dtype)
++        _kv_fix[:, 448 + 1 :: 2] = (_x2 * _cos + _x1 * _sin).to(_kv_fix.dtype)
++        _tl_insert_k(
++            _kv_fix,
+             swa_kv_cache_2d,
+             swa_metadata.slot_mapping,
+-            positions.to(torch.int64),
+-            self.rotary_emb.cos_sin_cache,
+-            self.eps,
+             swa_metadata.block_size,
+         )
+ 
+ 
++_DSV4A_SEEN: dict = {}
++
++
++def _dsv4a_dbg(tag, t):
++    import os
++    if os.environ.get("DSV4_DEBUG") != "1":
++        return
++    n = _DSV4A_SEEN.get(tag, 0)
++    if n >= 8:
++        return
++    _DSV4A_SEEN[tag] = n + 1
++    _dump_dir = os.environ.get("DSV4_DUMP", "")
++    if _dump_dir and t is not None and n <= 2:
++        try:
++            torch.save(t.detach().cpu(), f"{_dump_dir}/{tag}.{n}.pid{os.getpid()}.pt")
++        except Exception as e:
++            print(f"[dsv4adbg] dump fail {tag}: {e}", flush=True)
++    tf = t.detach().float()
++    print(f"[dsv4adbg] {tag}#{n}: shape={tuple(t.shape)} dtype={t.dtype} "
++          f"absmean={tf.abs().mean().item():.4e} absmax={tf.abs().max().item():.4e} "
++          f"nan={int(torch.isnan(tf).sum())} inf={int(torch.isinf(tf).sum())}", flush=True)
++
++
+ def deepseek_v4_attention(
+     hidden_states: torch.Tensor,
+     positions: torch.Tensor,
+@@ -1035,6 +1110,16 @@
+             )
+ 
+             if current_platform.is_rocm():
++                _dsv4a_dbg("mla.q_chunk", q[query_start:query_end])
++                try:
++                    _gl = int(gather_lens[chunk_start].item())
++                except Exception:
++                    _gl = 0
++                _dsv4a_dbg("mla.kv_gathered", kv[0, : max(_gl + N, 1)])
++                _dsv4a_dbg("mla.combined_indices", combined_indices)
++                _dsv4a_dbg("mla.combined_lens", combined_lens)
++                if self.attn_sink is not None:
++                    _dsv4a_dbg("mla.attn_sink", self.attn_sink)
+                 rocm_sparse_attn_prefill(
+                     q=q[query_start:query_end],
+                     kv=kv.view(-1, 1, q.shape[-1]),
+@@ -1045,6 +1130,7 @@
+                     attn_sink=self.attn_sink,
+                     output=output[query_start:query_end],
+                 )
++                _dsv4a_dbg("mla.out_chunk", output[query_start:query_end])
+             else:
+                 output_chunk, _, _ = flash_mla_sparse_fwd(
+                     q=q[query_start:query_end],

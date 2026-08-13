@@ -1,0 +1,28 @@
+--- /tmp/orig/vllm_rocm_aiter_mla_sparse.py	2026-08-10 01:28:30.676949892 +0800
++++ /data1/vllm_mla_sparse_patched.py	2026-08-10 01:02:23.389199827 +0800
+@@ -898,9 +898,22 @@
+         )
+         wo_a_weight = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
+     else:
+-        wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
+-            torch.bfloat16
+-        )
++        _w = wo_a.weight
++        if _w.shape[0] == n_local_groups * o_lora_rank:
++            # upstream vllm layout: [out=groups*o_lora, in=hidden]
++            wo_a_weight = _w.view(n_local_groups, o_lora_rank, hidden_dim).to(
++                torch.bfloat16
++            )
++        else:
++            # patched(gfx928): hygon pluggable linear stores weight transposed
++            # ([in=hidden, out=groups*o_lora]); a raw .view() on it silently
++            # scrambles memory. Rebuild [groups, o_lora, hidden] from the
++            # transposed layout instead.
++            wo_a_weight = (
++                _w.view(hidden_dim, n_local_groups, o_lora_rank)
++                .permute(1, 2, 0)
++                .to(torch.bfloat16)
++            )
+ 
+     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+ 

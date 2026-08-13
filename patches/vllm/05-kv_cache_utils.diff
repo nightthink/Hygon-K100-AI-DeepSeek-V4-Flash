@@ -1,0 +1,13 @@
+--- /tmp/orig/kv_cache_utils.py	2026-08-10 01:28:30.680949882 +0800
++++ /data1/kv_cache_utils_patched.py	2026-08-09 17:59:59.636162838 +0800
+@@ -1742,9 +1742,7 @@
+         kv_cache_config: The resolved KV cache configuration
+     """
+     max_model_len = vllm_config.model_config.max_model_len
+-    max_concurrency = get_max_concurrency_for_kv_cache_config(
+-        vllm_config, kv_cache_config
+-    )
++    max_concurrency = -1.0  # patched: skip stat (zero page_size spec)
+ 
+     # GPU KV cache size in tokens = max_concurrency * max_model_len: the total
+     # tokens of context the pool can hold at peak utilization. Sourcing this

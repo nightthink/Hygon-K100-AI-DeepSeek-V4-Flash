@@ -1,0 +1,14 @@
+--- /tmp/orig/worker_utils.py	2026-08-10 01:28:30.683949874 +0800
++++ /data1/worker_utils_patched.py	2026-08-09 18:25:17.737255717 +0800
+@@ -323,7 +323,10 @@
+             continue
+         if block_size_is_supported(backends, supported_size):
+             return supported_size
+-    raise ValueError(f"No common block size for {kv_manager_block_size}. ")
++    _diag = [(type(b).__name__ if not isinstance(b, type) else b.__name__,
++              b.get_supported_kernel_block_sizes()) for b in backends]
++    raise ValueError(
++        f"No common block size for {kv_manager_block_size}. backends={_diag}")
+ 
+ 
+ def prepare_kernel_block_sizes(
