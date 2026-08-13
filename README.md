@@ -51,4 +51,4 @@ scripts/
 
 ---
 
-Copyright © 2026 DaoTech Team. All rights reserved.
+Copyright © 2026 DaoTech Team. Licensed under the MIT License.
