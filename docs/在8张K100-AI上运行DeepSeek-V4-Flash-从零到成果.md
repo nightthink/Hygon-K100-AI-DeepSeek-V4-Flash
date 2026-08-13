@@ -708,4 +708,4 @@ vLLM 0.21.0；vllm_hcu 平台插件；DAS torch 2.10 / triton / tilelang（PDL �
 
 ---
 
-Copyright © 2026 DaoTech Team. All rights reserved.
+Copyright © 2026 DaoTech Team. Licensed under the MIT License.
