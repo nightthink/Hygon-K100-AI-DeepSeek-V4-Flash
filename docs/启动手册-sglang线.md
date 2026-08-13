@@ -159,4 +159,4 @@ cd /home/user/image_bake/sglang && docker build -t lzd/dsv4-flash-k100ai-sglang:
 
 ---
 
-Copyright © 2026 DaoTech Team. All rights reserved.
+Copyright © 2026 DaoTech Team. Licensed under the MIT License.
