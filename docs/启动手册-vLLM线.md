@@ -120,3 +120,7 @@ cd /home/user/image_bake/vllm && docker build -t lzd/dsv4-flash-k100ai-vllm:0706
 ```
 
 跨机复制：`docker save -o x.tar lzd/dsv4-flash-k100ai-vllm:0706-patched-v1` → `scp` 到目标机 → `docker load -i x.tar`（建议 md5sum 校验）。补丁的 unified diff（6 个共 344 行）与根因分析见交付打包件 patches/ 目录及部署文档。
+
+---
+
+Copyright © 2026 DaoTech Team. All rights reserved.
