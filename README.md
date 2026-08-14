@@ -68,6 +68,42 @@ DSpark 侧可调项已试遍，**天花板在 verify 前向本身**：
 
 生产定稿配置（0728 主线）：bf16 KV + MTP（EAGLE steps=3）+ 双解析器（reasoning/tool-call）+ radix 前缀缓存，`mem-fraction-static 0.85` / `chunked-prefill 4096` / `CUDA_GRAPH_MAX_BS 16`。长上下文实测：23K prompt prefill ~343 tok/s（TTFT ~45s），98K ~395 tok/s（~4.1min），前缀缓存命中 TTFT 0.8s。
 
+## 相关仓库
+
+本项目不重复造轮子，三条路线分别建立在下列上游之上。列出它们在本项目中的**实际用途**，
+便于复现者直接定位来源。
+
+### 模型
+
+| 仓库 | 在本项目中的作用 |
+|---|---|
+| [deepseek-ai/DeepSeek-V4-Flash](https://github.com/deepseek-ai/DeepSeek-V4-Flash) | 模型主页与技术说明；0731 正式版的 DSpark 结构、`dspark_block_size` 等 config 字段以此为准 |
+| [HuggingFace · deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | 权重来源（本仓库不含权重，需自行下载后按 `scripts/` 量化）；`generation_config.json` 的本地部署推荐参数出处 |
+
+### 海光（HYGON-AI）
+
+| 仓库 | 在本项目中的作用 |
+|---|---|
+| [HYGON-AI/sglang-das](https://github.com/HYGON-AI/sglang-das) | 海光 sglang 分支，生产主线的上游。**报障目标仓库**（分支 `v0.5.15.post1_dev`）；`dflash renorm` 兜底补丁移植自其 2026-08-13 提交 `18e167b7`；本仓库 `docs/Bug报告-*.md` 即针对该仓库 |
+| [HYGON-AI/vllm-plugin-das](https://github.com/HYGON-AI/vllm-plugin-das) | 海光 vLLM 插件，回退线的上游；`patches/vllm/` 的 6 个 gfx928 正确性补丁针对它 |
+| [HYGON-AI/inference-cookbook-das](https://github.com/HYGON-AI/inference-cookbook-das) | 海光官方推理示例与启动参数参考。注意其启动器面向 BW 卡（gfx936/938），**在 K100-AI 上照抄必崩**，需按 `docs/0731升级与DSpark实战.md` 附一替换整套 env |
+
+### FlagOS（智源 / flagos-ai）
+
+| 仓库 | 在本项目中的作用 |
+|---|---|
+| [flagos-ai/DeepSeek-V4-FlagOS](https://github.com/flagos-ai/DeepSeek-V4-FlagOS) | 精度参考线的模型侧支持；**权重管线的反量化脚本 `convert_weight.py` 来自这里**（FP4/FP8 → BF16，我方以 `--device cpu` 运行，见 `docs/0731升级与DSpark实战.md` 第 2.2 节） |
+| [flagos-ai/vllm-plugin-FL](https://github.com/flagos-ai/vllm-plugin-FL) | FlagOS 线所用的 vLLM 插件（我方在其上打了 19 个补丁才跑通，性能不足但可作数值对齐基准） |
+| [flagos-ai/community](https://github.com/flagos-ai/community) | FlagOS 社区仓库：路线图、支持矩阵与问题反馈入口 |
+| [flagos-ai/EasyOfUse](https://github.com/flagos-ai/EasyOfUse) | FlagOS 的易用性工具与部署示例集合 |
+
+### 上游框架
+
+| 仓库 | 在本项目中的作用 |
+|---|---|
+| [sgl-project/sglang](https://github.com/sgl-project/sglang) | 生产主线框架上游。本仓库 `patches/sglang-0811/patch_triton_backend.py`（triton 路由）针对的是 `debug_flash_mla_adapter.py`，该缺口在上游与海光分支中至今均未修复 |
+| [vllm-project/vllm](https://github.com/vllm-project/vllm) | 回退线框架上游 |
+
 ## 仓库结构
 
 ```
