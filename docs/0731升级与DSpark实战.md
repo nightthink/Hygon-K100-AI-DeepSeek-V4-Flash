@@ -198,9 +198,9 @@ TypeError: 'NoneType' object is not callable
 
 ---
 
-## 6. 唯一阻碍：非贪心 + 高并发触发 GPU 硬件异常
+## 6. 唯一阻碍：非贪心 + 并发触发 GPU 硬件异常（第 22–24 轮深挖）
 
-### 现象
+### 6.1 现象
 
 ```
 Callback: Queue 0x... aborting with error : HSA_STATUS_ERROR_EXCEPTION:
@@ -209,58 +209,110 @@ An HSAIL operation resulted in a hardware exception. code: 0x1016
 
 随后 `Scheduler watchdog timeout (300s)`，服务不可用，必须重启容器。
 
-### 隔离矩阵（每格独立实验，崩溃后重启再测）
+### 6.2 决定性对照实验：问题属于 DSpark，不属于镜像/权重/平台
 
-| 并发 | temperature=0（贪心） | temperature=0.7（非贪心） |
+这是第 24 轮做的关键一步——固定其它变量，只切换是否启用 DSpark：
+
+| 组合 | temp 0.7 × 8 并发 | 说明 |
 |---|---|---|
-| 1 | ✅ 33.8 tok/s | ✅ |
-| 2 | ✅ | ✅ |
-| 4 | ✅ 32.5 tok/s | ❌ GPU 硬件异常 |
-| 8 | ✅ 50.2 tok/s | ❌ GPU 硬件异常 |
-| 10 | ✅ 46.3 tok/s | 未测（已知会崩） |
+| 0728 镜像 + 4 月版权重 + EAGLE MTP | ✅ 正常 | 老投机路径无此问题 |
+| **0811 镜像 + 0731 权重 + 无投机** | **✅ 8/8 成功，聚合 52.2 tok/s** | 同镜像、同权重、同 triton 注意力后端 |
+| 0811 镜像 + 0731 权重 + **DSpark** | ❌ HSA 硬件异常 | 唯一变量是 DSpark |
 
-四种缓解手段全部无效：
+中间一行排除了 0811 镜像本身、0731 权重、gfx928 triton 注意力后端、以及采样器
+（`top_k_renorm_prob` 的 torch 兜底）作为诱因——问题被完全钉在 DSpark 的投机接受路径上。
+顺带的收获：**0811 镜像即使不开 DSpark 也比 0728 快**（无投机 8 并发 52.2 vs 55.9 属同档，
+但非贪心场景在 0811 上完全可用）。
 
-- 缩小 draft 块（`--speculative-dspark-block-size 3`，验证窗口 6→4）：**同样崩溃**
-- 显式 `top_k=50` 走稀疏路径（绕开稠密全词表兜底）：成功率 0/8 → 4/8，**仍会挂起**
-- `--max-running-requests 4` 限流（日志确认 `#queue-req: 4`，运行批量确实被限制）：**依然崩溃**
-- 降低并发到 2：可用，但对 8-10 路场景没有实用价值
+### 6.3 六项缓解措施，全部无效
 
-**定位**：崩溃在 DSpark 非贪心接受路径
-（`dspark_components/kernels/dspark_accept.py::accept_sampling_triton`）。贪心路径走纯 torch 的
-`compute_dflash_correct_drafts_and_bonus`，完全稳定。查 HYGON-AI/sglang-das 的
-`v0.5.15.post1_dev` 分支，2026-08-05 之后**没有任何针对 hang/deadlock/并发退化的 DSpark 提交**，
-属新发现，已整理为 Bug 报告条目。
+| # | 尝试 | 结果 |
+|---|---|---|
+| 1 | `--speculative-dspark-block-size 3`（验证窗口 6→4） | 同样崩溃，与 draft 块大小无关 |
+| 2 | 显式 `top_k=50` 走稀疏路径（绕开稠密全词表兜底） | 成功率 0/8 → 4/8，仍会挂起 |
+| 3 | `--max-running-requests 4`（日志确认 `#queue-req: 4`，批量确被限制） | 依然崩溃，不是"运行批量过大" |
+| 4 | `SGLANG_DSPARK_FORCE_TORCH_ACCEPT=1`（改 `kernels/dispatch.py::inputs_on_cuda` 恒返 False，强制 torch 参考实现） | 依然崩溃 → 诱因不限于 `accept_sampling_triton` 单个内核 |
+| 5 | 关闭 JIT `moe_align_block_size` | 无影响 |
+| 6 | 冷启动下降并发到 4 | 仍崩溃（但预热后可用，见下） |
+
+### 6.4 唯一有效的缓解：预热非贪心路径
+
+服务起来后**先发若干条单路 temperature>0 请求**，把非贪心接受路径的 triton JIT 编译与
+首次分配走完，再上并发：
+
+| 并发 | temperature=0（贪心） | temp 0.7 冷启动 | temp 0.7 **预热后** |
+|---|---|---|---|
+| 1 | ✅ 33.8 tok/s | ✅ | ✅ |
+| 2 | ✅ | ✅ 13.4 tok/s | ✅ |
+| 4 | ✅ 32.5 tok/s | ❌ GPU 硬件异常 | **✅ 32.4 tok/s** |
+| 8 | ✅ 50.2 tok/s（8/8） | ❌ GPU 硬件异常（0–1/8） | ⚠️ 软挂起（无 HSA 异常，请求不返回） |
+| 10 | ✅ 46.3 tok/s（10/10） | 未测（已知会崩） | 未测 |
+
+预热把安全并发从 2 提到 4，并且把 8 并发的失效形态从**硬件异常 + watchdog 超时**降级为
+**软挂起**（进程存活、无内核异常）。这强烈提示崩溃与该路径的**首次并发触发**（JIT 编译 /
+首次显存分配 / 首次 kernel launch 与并发调度叠加）有关，而非稳态计算的越界访存。
+
+### 6.5 一个需要澄清的干扰项
+
+`moe_align_block_size_kernel` 的 `Launch params (1024,1,1) are larger than launch bounds (256)`
+警告，在**稳定的贪心运行中同样出现**，因此它不是本问题的诱因，只是一条独立的次要建议。
+排查时差点被它带偏，记在这里提醒后来者。
+
+### 6.6 当前定位与上游状态
+
+崩溃位于 DSpark 非贪心接受路径（`dspark_components/kernels/dspark_accept.py`，但第 4 项
+实验说明不止这一个内核）。贪心路径走纯 torch 的 `compute_dflash_correct_drafts_and_bonus`，
+完全稳定。查 HYGON-AI/sglang-das 的 `v0.5.15.post1_dev` 分支，2026-08-05 之后**没有任何
+针对 hang/deadlock/并发退化的 DSpark 提交**，属新发现，已整理为
+`docs/Bug报告-DSpark与triton路由.md` 提交海光。
 
 ---
 
 ## 7. 生产化建议
 
-**可以现在就用**，前提是锁定贪心解码：
+### 7.1 当前可用边界
 
-- 编程助手场景绝大多数使用 temperature=0，而**贪心路径 1/2/4/8/10 并发全部稳定**。
-- 需要在网关层强制 `temperature=0`，因为任意一个 temperature>0 的请求都可能拖垮服务。
+| 场景 | 可用性 |
+|---|---|
+| 贪心（temperature=0），1/2/4/8/10 并发 | ✅ 全部稳定，可直接生产 |
+| 非贪心 + 启动预热，≤4 并发 | ✅ 可用（4 并发 32.4 tok/s） |
+| 非贪心，≥8 并发 | ❌ 不可用 |
+
+**可以现在就用**，前提是网关层锁定 `temperature=0`：编程助手场景绝大多数使用贪心解码，
+而贪心路径在全部测过的并发档位都稳定。若确实需要采样，可以在启动脚本里加入非贪心预热，
+并把并发上限压到 4。
+
+> 关于温度的一个澄清：DeepSeek 官方 API 在思考模式下**忽略** temperature 参数，
+> 但这是 API 侧行为。0731 权重的 `generation_config.json` 是 `do_sample=true` /
+> `temperature=1.0`，官方模型卡对本地部署推荐 `temperature=1.0`。也就是说
+> **官方推荐配置恰好落在故障区间内**，这一点在报障时特意向海光强调了。
+
+### 7.2 与保守方案的取舍
 
 **保守方案**：生产维持 4 月版 + MTP（18.7 tok/s，任意温度全稳），等海光修复内核后再切。
-
-两个方案的取舍：
 
 | | DSpark（锁贪心） | 4 月版 + MTP |
 |---|---|---|
 | 单流 | 33.8 | 18.7 |
 | 23K prefill | 437 tok/s | 343 tok/s |
 | 模型能力 | 0731（DeepSWE 54.4） | 4 月版（DeepSWE 7.3） |
-| 温度自由度 | ❌ 必须 0 | ✅ 任意 |
+| 温度自由度 | ❌ 必须 0（或预热 + ≤4 并发） | ✅ 任意 |
 | 稳定性 | 贪心下稳定 | 全场景稳定 |
+
+**第三方案**（第 24 轮新增可选项）：0811 镜像 + 0731 权重 **不开投机**。单流只有 12.3 tok/s
+不划算，但它在任意温度、8 并发下完全稳定（52.2 tok/s 聚合），可作为"必须支持采样"的
+高并发场景的备用配置。
 
 ---
 
 ## 8. 复现所需
 
-- 补丁：`patches/sglang-0811/`（三个补丁 + 启动器）
+- 补丁：`patches/sglang-0811/`（三个必需补丁 + 一个诊断用补丁 + 启动器）
 - 量化：`scripts/quant_w8a8_0731.py`、`scripts/run_0731_pipeline.sh`
-- 启动：`scripts/start_0731_dspark.sh`（0811+DSpark）、`scripts/start_0731_base.sh`（0728 基线）
-- 测试：`tests/longctx_fresh.py`、`tests/bench_conc_param.py`、`tests/test_coding_speed.py`
+- 启动：`scripts/start_0731_dspark.sh`（0811+DSpark）、`scripts/start_0731_base.sh`（0728 基线）、
+  `scripts/start_0811_nospec.sh`（0811 无投机，非贪心高并发备用）
+- 测试：`tests/longctx_fresh.py`、`tests/bench_conc_param.py`、`tests/test_coding_speed.py`、
+  `tests/warmup_then_bench.sh`（预热假设验证）
 - Bug 报告：`docs/Bug报告-DSpark与triton路由.md`
 
 模型权重不在本仓库（需自行下载 `deepseek-ai/DeepSeek-V4-Flash-0731` 并按第 2 节量化）。
