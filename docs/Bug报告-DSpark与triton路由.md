@@ -1,9 +1,9 @@
-# 提交材料：K100-AI（gfx928）上 DeepSeek-V4-Flash + DSpark 的两个问题
+# 提交材料：K100-AI（gfx928）上 DeepSeek-V4-Flash + DSpark 的三个问题
 
 > 目标仓库：`HYGON-AI/sglang-das`（分支 `v0.5.15.post1_dev`）
 > 报告方环境：8×海光 K100-AI（gfx928）/ DTK 26.04 / DeepSeek-V4-Flash-0731 W8A8
 > 使用镜像：`custom:sglang0.5.12-...-20260804-0006-deepseekV4-0811`（内含 sglang 0.5.15.post2.dev564+gb97d7df6e）
-> 日期：2026-08-14（问题二于 8-14 补充对照实验与预热发现）
+> 日期：2026-08-14（问题二补充对照实验与预热发现；问题三为当日新增）
 
 ---
 
@@ -11,7 +11,7 @@
 
 我方在 K100-AI 上把 DeepSeek-V4-Flash-0731 + DSpark 跑通，**单流解码从 12.3 tok/s 提升到 33.8 tok/s（2.75×）**，
 比我方原生产配置（4 月版 + EAGLE MTP，18.7 tok/s）快 **80%**。过程中需要自行补一个补丁（问题一），
-并发现一个尚无对应修复的 GPU 硬件异常（问题二）。
+并发现两个尚无对应修复的问题：一个 GPU 硬件异常（问题二）、一个静默正确性故障（问题三）。
 
 实测数据（8×K100-AI，W8A8，TP=8，`mem-fraction-static 0.85`，`chunked-prefill 4096`，`cuda-graph-max-bs 16`）：
 
@@ -207,6 +207,58 @@ temperature>0 with a torch implementation"）后该报错消失，**但随即暴
 
 ---
 
+## 问题三【P0，新发现】`--kv-cache-dtype bfloat16` 在 dsv4 解码路径上静默产出乱码
+
+### 现象
+
+把 KV cache 从默认的 `fp8_e4m3` 改为 `bfloat16` 后，**服务正常启动、不报任何错误、
+性能指标反而"变好"，但模型输出是彻底的乱码**：
+
+```
+问：计算 37*89-156，只给出最终数字。
+答："  enc inisidg1...\n\n ( (ife for example 0...；"
+
+问：你好，请自我介绍。
+答："emic summary data ( 2. "
+```
+
+`finish_reason` 正常、`reasoning_content` 为空、日志无任何 warning/error。
+
+### 最危险的一点：所有性能指标都在"变好"
+
+| 指标 | fp8 KV（正确） | **bf16 KV（乱码）** |
+|---|---|---|
+| 单流解码 | 33.8 tok/s | **44.1 tok/s（峰值 50.7）** |
+| DSpark accept len | 4.38 | **6.00（满窗）** |
+| DSpark accept rate | 0.68 | **1.00** |
+| KV 池 | 1,026,816 | 697,600 |
+
+一个只看 tok/s 的调优流程会把这个配置判为"提速 30%、终于达标"，直接推上生产。
+**accept rate 恒为 1.00 是关键告警信号**：drafter 与 target 读的是同一份坏 KV，
+一起算错到同一个地方，于是"全部命中"。
+
+### 根因
+
+问题一接入的解码内核是 `triton_fp8_attention_fwd`，它按 **fp8 布局**解释 `k_cache`。
+当 `--kv-cache-dtype bfloat16` 时，KV pool 里存的是 bf16，内核照旧按 fp8 读取，
+得到的是无意义数值；注意力输出因此是噪声，但整条链路没有任何形状/类型检查会拦下它。
+
+### 建议
+
+在 `DeepseekV4AttnBackend` 初始化时校验 `kv_cache_dtype` 与所选解码后端的兼容性：
+`SGLANG_HACK_FLASHMLA_BACKEND=triton`（以及其它 fp8 专用内核）应当在 KV dtype 非 fp8 时
+**直接拒绝启动并给出明确报错**，或路由到匹配 dtype 的实现。静默产出乱码是这三个问题里
+危害最大的一种失效方式——它不会中断服务，只会污染结果。
+
+### 附带确认
+
+我方据此确认：**在 0811 + DSpark 线上，fp8 KV 不是可选项而是必需项**。
+这与我方此前在 0728 线（4 月版 + EAGLE MTP）上的结论正好相反——那条线上 fp8 KV
+比 bf16 慢 14% 且破坏 Think 输出。两条线走的是不同的注意力内核，结论不可互相套用，
+建议贵方在文档中明确各解码后端对 KV dtype 的硬性要求。
+
+---
+
 ## 附一：gfx928 上跑通 DSpark 所需的完整配置
 
 官方启动器面向 BW 卡，在 K100-AI 上照抄必崩。以下为我方验证可用的组合：
@@ -228,7 +280,10 @@ export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 # 3. 本报告问题一的补丁启用的解码后端
 export SGLANG_HACK_FLASHMLA_BACKEND=triton
 
-# 4. 其余沿用官方 0728 k100ai 启动器的 env（GPU_MAX_HW_QUEUES=3、HIP_KERNEL_BATCH_CEILING=100、
+# 4. KV cache 必须是 fp8（见问题三）：保持 SGLANG_DSV4_INT8_KV_CACHE=true + --kv-cache-dtype auto
+#    （auto 在本模型上解析为 fp8_e4m3；显式指定 bfloat16 会静默乱码）
+
+# 5. 其余沿用官方 0728 k100ai 启动器的 env（GPU_MAX_HW_QUEUES=3、HIP_KERNEL_BATCH_CEILING=100、
 #    SGLANG_USE_LIGHTOP=1、SGLANG_ROCM_USE_AITER_MOE=false 等约 20 项）
 ```
 
@@ -244,7 +299,22 @@ export SGLANG_HACK_FLASHMLA_BACKEND=triton
    `Launch params (1024, 1, 1) are larger than launch bounds (256)`，建议补 `__launch_bounds__`
    或用 `--gpu-max-threads-per-block` 重编。（如上文所述，此项与问题二无关。）
 
-## 附三：验证支持
+## 附三：性能诉求的量化依据（应用层已穷尽）
+
+我方已把 DSpark 侧可调项试遍，结论是**单流速度的天花板在 verify 前向本身**：
+
+| 配置 | accept len | 单流 tok/s | 推得的 verify 步频 |
+|---|---|---|---|
+| block=5（模型训练值）、阈值 1.0/1.0 | 4.38 | 33.8 | 7.72 步/s（≈130 ms/步） |
+| 接受阈值放宽到 0.9 / 0.8 | 4.55 | 33.3 | 7.32 步/s |
+| block=8 | 4.20（rate 0.40） | 28.3 | — |
+| block=3 | — | 更慢 | — |
+
+放宽接受阈值确实提高了命中率，但速度不变——说明**再高的投机命中率也换不来速度**，
+瓶颈是每步约 130 ms 的 verify 前向（NSA decode 内核 + allreduce + MoE）。
+我方目标 50 tok/s 对应单步 ≈88 ms，需要内核层约 1.5× 的提升，这已超出应用层可为的范围。
+
+## 附四：验证支持
 
 我方有 8×K100-AI 环境与完整的验收/压测/长上下文脚本（含 23K/98K 实测基线），
 修复版镜像可在 1 天内完成回归对比。
