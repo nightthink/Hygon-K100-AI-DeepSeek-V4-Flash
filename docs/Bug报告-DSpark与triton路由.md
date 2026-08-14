@@ -3,7 +3,7 @@
 > 目标仓库：`HYGON-AI/sglang-das`（分支 `v0.5.15.post1_dev`）
 > 报告方环境：8×海光 K100-AI（gfx928）/ DTK 26.04 / DeepSeek-V4-Flash-0731 W8A8
 > 使用镜像：`custom:sglang0.5.12-...-20260804-0006-deepseekV4-0811`（内含 sglang 0.5.15.post2.dev564+gb97d7df6e）
-> 日期：2026-08-14
+> 日期：2026-08-14（问题二于 8-14 补充对照实验与预热发现）
 
 ---
 
@@ -114,7 +114,7 @@ torch/tilelang/triton/kernel 四种）。我方选择前者是因改动面更小
 
 ### 现象
 
-`--speculative-algorithm DSPARK` 下，**temperature > 0** 的请求并发数超过约 2 时：
+`--speculative-algorithm DSPARK` 下，**temperature > 0** 的请求并发到一定数量后：
 
 ```
 Callback: Queue 0x... aborting with error : HSA_STATUS_ERROR_EXCEPTION:
@@ -125,25 +125,55 @@ An HSAIL operation resulted in a hardware exception. code: 0x1016
 
 ### 隔离矩阵（每格均为独立实验，崩溃后重启服务再测）
 
-| 并发 | temperature=0（贪心） | temperature=0.7（非贪心） |
+| 并发 | temperature=0（贪心） | temperature=0.7 冷启动 | temperature=0.7 **预热后** |
+|---|---|---|---|
+| 1 | ✅ 33.8 tok/s | ✅ | ✅ |
+| 2 | ✅ | ✅ 13.4 tok/s | ✅ |
+| 4 | ✅ 32.5 tok/s | ❌ GPU 硬件异常 | **✅ 32.4 tok/s** |
+| 8 | ✅ 50.2 tok/s（8/8） | ❌ GPU 硬件异常（0–1/8） | ⚠️ 软挂起（无 HSA 异常，但请求不返回） |
+| 10 | ✅ 46.3 tok/s（10/10） | 未测（已知会崩） | 未测 |
+
+"预热"= 服务起来后先发若干条 **单路 temperature>0** 请求，把非贪心接受路径的 triton JIT
+编译与首次分配走完，再上并发。
+
+### 关键对照实验：确认是 DSpark 专属，而非镜像/权重/平台问题
+
+| 组合 | temp 0.7 × 8 并发 | 结论 |
 |---|---|---|
-| 1 | ✅ 33.8 tok/s | ✅ |
-| 2 | ✅ | ✅ |
-| 4 | ✅ 32.5 tok/s | ❌ GPU 硬件异常 |
-| 8 | ✅ 50.2 tok/s（8/8 成功） | ❌ GPU 硬件异常（0-1/8 成功） |
-| 10 | ✅ 46.3 tok/s（10/10 成功） | 未测（已知会崩） |
+| 0728 镜像 + 4 月版权重 + EAGLE MTP | ✅ 正常 | 老投机路径无此问题 |
+| **0811 镜像 + 0731 权重 + 无投机** | **✅ 8/8 成功，52.2 tok/s 聚合** | **同镜像同权重同 triton 后端下非贪心并发完全稳定** |
+| 0811 镜像 + 0731 权重 + **DSpark** | ❌ HSA 硬件异常 | 唯一变量是 DSpark |
 
-已排除的因素：
+中间一行是本报告最重要的一条证据：它排除了 0811 镜像、0731 权重、gfx928 triton 注意力后端、
+以及采样器本身（`top_k_renorm_prob` 的 torch 兜底）作为诱因，把问题完全钉在 DSpark 的
+投机接受路径上。
 
-- **draft 块大小无关**：`--speculative-dspark-block-size 3`（验证窗口 6→4）同样崩溃。
-- **不只是稠密全词表路径**：显式指定 `top_k=50` 走稀疏路径后，成功率从 0/8 提升到 4/8，
-  但仍会挂起——说明 `build_dflash_verify_target_probs` 的稠密分支不是唯一诱因。
-- **限流无效**：`--max-running-requests 4`（日志确认 `#queue-req: 4`、运行批量确实被限制）
-  依然崩溃。
+### 已排除的因素（六项独立缓解措施，全部无效）
 
-**定位**：崩溃发生在 DSpark 非贪心接受路径
-（`sglang/srt/speculative/dspark_components/kernels/dspark_accept.py::accept_sampling_triton`）。
-贪心路径走的是纯 torch 的 `compute_dflash_correct_drafts_and_bonus`，完全稳定。
+| # | 尝试 | 结果 |
+|---|---|---|
+| 1 | `--speculative-dspark-block-size 3`（验证窗口 6→4） | 同样崩溃，与 draft 块大小无关 |
+| 2 | 显式 `top_k=50` 走稀疏路径 | 成功率 0/8 → 4/8，仍挂起；稠密全词表分支不是唯一诱因 |
+| 3 | `--max-running-requests 4`（日志确认批量确被限制） | 依然崩溃，不是"运行批量过大" |
+| 4 | `SGLANG_DSPARK_FORCE_TORCH_ACCEPT=1`（令 `kernels/dispatch.py::inputs_on_cuda` 恒返 False，强制走 torch 参考实现） | 依然崩溃，说明诱因不限于 `accept_sampling_triton` 单个内核 |
+| 5 | 关闭 JIT `moe_align_block_size` | 无影响 |
+| 6 | 降并发到 4（冷启动） | 崩溃（但预热后可用，见下） |
+
+### 唯一有效的缓解：预热非贪心路径
+
+先用单路 temperature>0 请求把该路径跑热，安全并发从 **2 提升到 4**（4 并发 32.4 tok/s，
+冷启动时同配置必崩）；8 并发仍不可用，但失效形态从 **HSA 硬件异常 + watchdog 超时**
+降级为**软挂起**（进程存活、无内核异常、请求不返回）。
+
+这提示崩溃与该路径的**首次并发触发**（triton JIT 编译 / 首次显存分配 / 首次 kernel launch
+与并发调度叠加）强相关，而非稳态计算本身的越界访存。建议贵方从这个方向排查：DSpark
+非贪心接受路径的 JIT/首次调用是否在多请求并发进入时存在竞态。
+
+### 一个需要澄清的干扰项（非诱因）
+
+`moe_align_block_size_kernel` 的
+`Launch params (1024, 1, 1) are larger than launch bounds (256)` 警告在**稳定的贪心运行中
+同样出现**，因此它不是本问题的诱因，仅作为独立的次要建议列在附二。
 
 ### 相关但不同的一个问题（贵方已修，我方已移植验证）
 
@@ -159,10 +189,21 @@ TypeError: 'NoneType' object is not callable
 temperature>0 with a torch implementation"）后该报错消失，**但随即暴露出上面的硬件异常**。
 建议在合入该修复时一并回归 gfx928 上的多并发非贪心场景。
 
-### 我方当前规避
+### 我方当前可用边界与规避
 
-生产侧限制为贪心解码（temperature=0）。编程助手场景多数使用 temperature=0，因此
-DSpark 仍可投入使用；但任意一个 temperature>0 的请求就可能拖垮服务，需要网关层强制。
+| 场景 | 可用性 |
+|---|---|
+| 贪心（temperature=0），1/2/4/8/10 并发 | ✅ 全部稳定，可直接生产 |
+| 非贪心 + 预热，≤4 并发 | ✅ 可用（32.4 tok/s） |
+| 非贪心，≥8 并发 | ❌ 不可用 |
+
+生产侧限制为贪心解码。编程助手场景多数使用 temperature=0，因此 DSpark 仍可投入使用；
+但任意一批 temperature>0 的并发请求就可能拖垮服务，需要网关层强制。
+
+> 补充说明：DeepSeek-V4-Flash-0731 的 `generation_config.json` 为 `do_sample=true` /
+> `temperature=1.0`，官方模型卡对本地部署推荐 `temperature=1.0`（官方 API 在思考模式下
+> 忽略 temperature 参数，这是 API 侧行为，不等于本地权重不支持采样）。也就是说，
+> **推荐配置恰好落在本问题的故障区间内**，这使该问题的优先级高于"少数用户偶尔调高温度"。
 
 ---
 
@@ -201,7 +242,7 @@ export SGLANG_HACK_FLASHMLA_BACKEND=triton
    并回退默认配置（"Performance might be sub-optimal"）。建议随镜像附带 K100-AI 调优配置。
 2. **`moe_align_block_size` launch bounds 警告**：
    `Launch params (1024, 1, 1) are larger than launch bounds (256)`，建议补 `__launch_bounds__`
-   或用 `--gpu-max-threads-per-block` 重编。
+   或用 `--gpu-max-threads-per-block` 重编。（如上文所述，此项与问题二无关。）
 
 ## 附三：验证支持
 
