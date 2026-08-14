@@ -19,6 +19,8 @@ fi
 
 python3 /data1/sglang_patches/launchers_0811/patch_triton_backend.py
 python3 /data1/sglang_patches/launchers_0811/patch_dflash_renorm.py
+# 第 4 个补丁为诊断用途，自身按 SGLANG_DSPARK_FORCE_TORCH_ACCEPT 判断是否生效（默认空跑）
+python3 /data1/sglang_patches/launchers_0811/patch_dspark_torch_accept.py
 ulimit -l unlimited
 
 # --- 官方必需 env（沿用 0728 线实测有效的一整套）---
@@ -57,6 +59,14 @@ export SGLANG_LIGHTOP_TOPK=true
 export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=true
 export SGLANG_NSA_FUSE_TOPK=false
 export SGLANG_APPLY_CONFIG_BACKUP=none
+
+# --- moe_align 走 JIT 版内核（JIT_MOE_ALIGN=1 开启）---
+# gfx928 上预编译的 sgl_moe_align_block_size 以 1024 线程启动、却按 256 线程编译
+# （日志警告 "Launch params (1024,1,1) are larger than launch bounds (256)"）。
+# 注：该警告在稳定的贪心运行中同样出现，实测开启 JIT 版对 DSpark 非贪心并发崩溃
+# **无影响**，故它不是那个问题的诱因；此开关保留作对照实验用。
+export SGLANG_EXPERIMENTAL_LORA_OPTI=${JIT_MOE_ALIGN:-0}
+export SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN=${JIT_MOE_ALIGN:-0}
 
 # --- DSv4 注意力 ---
 export SGLANG_DSV4_MODE=2604
