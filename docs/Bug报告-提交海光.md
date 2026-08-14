@@ -7,6 +7,8 @@
 > ② `harbor.sourcefind.cn:5443/dcu/admin/base/custom:dsv4-flash-k100ai-sglang0.5.12-20260728`（下称 sglang-0728 镜像）
 > ③ `harbor.sourcefind.cn:5443/dcu/admin/base/custom:sglang0.5.12-ubuntu22.04-dtk2604-py3.10-20260804-0006-deepseekV4-0811`（下称 sglang-0811 镜像）
 > ④ `harbor.baai.ac.cn/flagos21-release/vllm-plugin-fl:v0.2.0-rc2-hygon`（FlagOS FL 镜像，涉及 flagtree hcu 后端时与贵方相关）
+>
+> **补充报告**：2026-08-14 新增两项，见同目录 `Bug报告-DSpark与triton路由.md` —— ①HCU 平台的 dsv4 注意力后端未接通 triton 解码路径（附最小补丁）；②DSpark 非贪心采样在 gfx928 上并发触发 GPU 硬件异常（附完整隔离矩阵）。
 
 ---
 
@@ -96,10 +98,12 @@
 - **现象**：`/usr/local/lib/python3.10/dist-packages/deep_gemm/_C.so` 链接 `libcudart.so.13`，在海光平台 dlopen 报 `libcudart.so.13: cannot open shared object file`。而 `SGLANG_OPT_DEEPGEMM_HC_PRENORM` 默认为 True，使 mhc_pre 默认路径 `import deep_gemm` 直接崩溃（CUDA graph 捕获期报 `Capture cuda graph failed: Failed to load dynamic shared library`）。
 - **建议修复**：镜像内置 HIP/DTK 编译版 deep_gemm，或在 HCU 平台把 `SGLANG_OPT_DEEPGEMM_HC_PRENORM` 默认置 0（官方启动器已这么做，但裸启动的用户必踩）。
 
-### C-2【P1】sglang-0811 镜像对 K100-AI 完全不可用且无架构标注
+### C-2【P1→已更正】sglang-0811 镜像缺架构标注（原判"完全不可用"经复测推翻）
 
-- **现象**：tag `sglang0.5.12-...-deepseekV4-0811` 无任何架构标注。实测其 tilelang 的 HCU GEMM 路径仅支持 MLS 架构：`HCU arch gfx928 not supported for MLS/GEMM_MLS; supported: gfx938, gfx92a, gfx946`（mhc_pre tilelang splitk 内核编译失败）；其 deepgemm 亦只含 gfx92a/936/938 code objects。即该镜像在 K100-AI 上 mhc 两条路径全死。
-- **建议**：镜像 tag 或 README 标明支持的 gfx 架构（0728 的 `dsv4-flash-k100ai-*` 命名是好实践）；tilelang 报错信息保持现状即可（已很明确）。
+- **原现象（2026-08-11 记录）**：tag `sglang0.5.12-...-deepseekV4-0811` 无任何架构标注。实测其 tilelang 的 HCU GEMM 路径仅支持 MLS 架构：`HCU arch gfx928 not supported for MLS/GEMM_MLS; supported: gfx938, gfx92a, gfx946`（mhc_pre tilelang splitk 内核编译失败）；其 deepgemm 亦只含 gfx92a/936/938 code objects。当时判定该镜像在 K100-AI 上不可用。
+- **⚠️ 更正（2026-08-14）**：上述结论**不成立**。原因是我方照抄了官方启动器，而那套 env 面向 BW 卡。实测该镜像的 `sgl_kernel` / `lightop` / `tilelang` / `triton` / `flash_mla` 二进制**均含 gfx928 代码对象**；把 tilelang/aiter 的 MHC 加速路径显式关闭（`SGLANG_OPT_USE_TILELANG_MHC_PRE/POST=0`、`SGLANG_OPT_USE_AITER_MHC_PRE/POST=0`、`SGLANG_DSV4_MHC_PREWARM=0`、`SGLANG_OPT_DEEPGEMM_HC_PRENORM=0`）后落到 `hc_pre_torch_impl`，MHC 不再崩溃。该镜像在 K100-AI 上**可以正常服务**，并支持 DSpark 投机解码，实测单流 33.8 tok/s（详见补充报告与《0731升级与DSpark实战》）。
+- **仍存在的问题**：①镜像 tag 标 0.5.12 但实际内含 sglang 0.5.15.post2.dev564，版本标识与内容不符；②仍无 gfx 架构标注；③官方启动器的 env 组合在 gfx928 上必崩，且无文档说明差异。
+- **建议**：镜像 tag/README 标明真实 sglang 版本与支持的 gfx 架构（0728 的 `dsv4-flash-k100ai-*` 命名是好实践）；为 K100-AI 提供一份可用的 env 组合或专用启动器。
 
 ### C-3【P1】量化 KV cache（int8 与 fp8 均复现）在 DSv4 上损伤 Think（长推理）质量，且解码变慢
 
@@ -183,6 +187,8 @@
 | vLLM 线 6 补丁 diff（每个对应一处 bug 的修复） | `/data1/patches/01~06-*.diff` | B-1…B-6 |
 | int8 KV Think 复读实录 | `/data1/TUNING_RECORD_20260811.md` 第 11 轮 | C-3 |
 | fp8 KV Think 复读 + 单流 -14% 实录 | `/data1/TUNING_RECORD_20260811.md` 第 20 轮 | C-3 |
+| DSpark 三补丁与 gfx928 启动器 | 本仓库 `patches/sglang-0811/` | 补充报告 |
+| DSpark 实测与隔离矩阵 | `/data1/TUNING_RECORD_20260811.md` 第 22-23 轮 | 补充报告 |
 | FlagOS 线 19 补丁与 24 错误全记录 | `/home/user/flagos.succ1/`（DEPLOYMENT.md） | D-1、D-2 |
 | 三条路线完整文档 | 《在8张K100-AI上运行DeepSeek-V4-Flash：从零到成果》 | 全部 |
 
