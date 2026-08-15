@@ -1,0 +1,12 @@
+# 本地交接/记忆文件——含内部环境信息（主机名、内网路径、镜像仓库、宿主机情况）
+# 本仓库公开，这些只能留在本地，不得提交
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+
+# 临时/运行产物
+*.log
+*.out
+__pycache__/
+*.pyc
+.DS_Store
